@@ -1,3 +1,14 @@
+✅ Améliorations apportées par rapport au projet original
+
+✔ HTTPS obligatoire
+✔ Gestion des erreurs API
+✔ Authentification MQTT
+✔ Compatible Python 3.13
+✔ Dépendances maîtrisées
+✔ Publication MQTT propre (retain)
+✔ Boucle simple et stable
+✔ Code maintenable
+
 # openweather-mqtt
 
 ![PEP8](https://github.com/rsaikali/openweather-mqtt/workflows/PEP8/badge.svg)
