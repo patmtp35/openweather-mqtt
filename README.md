@@ -9,6 +9,8 @@
 ✔ Boucle simple et stable
 ✔ Code maintenable
 
+la version forecast necessite openweather.env duement remplis
+
 # openweather-mqtt
 
 ![PEP8](https://github.com/rsaikali/openweather-mqtt/workflows/PEP8/badge.svg)
