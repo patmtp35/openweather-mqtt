@@ -2,6 +2,7 @@
 import logging
 import os
 import time
+import json
 import requests
 import paho.mqtt.publish as publish
 
@@ -14,7 +15,11 @@ OPENWEATHER_CITY_ID = os.getenv("OPENWEATHER_CITY_ID")
 
 MQTT_SERVICE_HOST = os.getenv("MQTT_SERVICE_HOST", "localhost")
 MQTT_SERVICE_PORT = int(os.getenv("MQTT_SERVICE_PORT", 1883))
+
+# IMPORTANT : topic final unique attendu par ESPHome
+# Exemple: home/lcdmeteo
 MQTT_SERVICE_TOPIC = os.getenv("MQTT_SERVICE_TOPIC", "home/lcdmeteo")
+
 MQTT_CLIENT_ID = os.getenv("MQTT_CLIENT_ID", "openweather-mqtt-service")
 MQTT_USERNAME = os.getenv("MQTT_USERNAME")
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")
@@ -41,34 +46,16 @@ logger = logging.getLogger(MQTT_CLIENT_ID)
 if not OPENWEATHER_APP_ID or not OPENWEATHER_CITY_ID:
     raise RuntimeError("OPENWEATHER_APP_ID and OPENWEATHER_CITY_ID must be set")
 
-if MQTT_USERNAME is None or MQTT_PASSWORD is None:
+if not MQTT_USERNAME or not MQTT_PASSWORD:
     raise RuntimeError("MQTT_USERNAME and MQTT_PASSWORD must be set")
 
-logger.info("Starting OpenWeather MQTT publisher")
+logger.info("Starting OpenWeather MQTT publisher (single JSON retained)")
 logger.info(f"MQTT broker : {MQTT_SERVICE_HOST}:{MQTT_SERVICE_PORT}")
 logger.info(f"MQTT topic  : {MQTT_SERVICE_TOPIC}")
+logger.info(f"Update interval : {UPDATE_INTERVAL}s")
 
 # ==========================================================
-# Helpers
-# ==========================================================
-
-def flatten_dict(data, parent_key="", sep="/"):
-    items = {}
-    if isinstance(data, dict):
-        for k, v in data.items():
-            new_key = f"{parent_key}{sep}{k}" if parent_key else k
-            items.update(flatten_dict(v, new_key, sep))
-    elif isinstance(data, list):
-        for i, v in enumerate(data):
-            new_key = f"{parent_key}{sep}{i}"
-            items.update(flatten_dict(v, new_key, sep))
-    else:
-        items[parent_key] = data
-    return items
-
-
-# ==========================================================
-# OpenWeather - météo actuelle
+# OpenWeather fetchers
 # ==========================================================
 
 def fetch_weather():
@@ -86,39 +73,17 @@ def fetch_weather():
         return None
 
     data = r.json()
-
     if "dt" not in data:
         logger.error(f"Invalid weather payload: {data}")
         return None
 
-    # Normalisation pluie
+    # Normalisation pluie (si absent)
     data.setdefault("rain", {})
     data["rain"].setdefault("1h", 0)
     data["rain"].setdefault("3h", 0)
 
     return data
 
-
-def publish_weather(data):
-    flat = flatten_dict(data)
-    msgs = []
-
-    for k, v in sorted(flat.items()):
-        topic = f"{MQTT_SERVICE_TOPIC}/current/{k}"
-        msgs.append({"topic": topic, "payload": str(v), "retain": True})
-        logger.info(f"{topic:55} -> {v}")
-
-    publish.multiple(
-        msgs,
-        hostname=MQTT_SERVICE_HOST,
-        port=MQTT_SERVICE_PORT,
-        client_id=MQTT_CLIENT_ID,
-        auth={"username": MQTT_USERNAME, "password": MQTT_PASSWORD},
-    )
-
-# ==========================================================
-# OpenWeather - prévisions
-# ==========================================================
 
 def fetch_forecast():
     url = "https://api.openweathermap.org/data/2.5/forecast"
@@ -141,75 +106,96 @@ def fetch_forecast():
 
     return data
 
+# ==========================================================
+# JSON builder (format attendu ESPHome)
+# ==========================================================
 
-def extract_forecast(forecast):
+def build_meteo_json(weather, forecast):
     """
-    index 0  -> +3h
-    index 8  -> +24h
-    index 32 -> +4 jours
+    Produit un JSON unique sur home/lcdmeteo (retain=true), style:
+
+    {
+      "current": {...},
+      "timezone": 3600,
+      "forecast": {
+        "0": { "temp": 14.3, "desc": "..." },
+        "1": { "temp": 13.3, "desc": "..." }
+      }
+    }
     """
-    result = {}
-    mapping = {
-        "3h": 0,
-        "1d": 8,
-        "4d": 32,
+
+    payload = {
+        "timezone": weather.get("timezone"),
+        "current": {
+            "sys": {
+                "sunrise": weather["sys"]["sunrise"],
+                "sunset": weather["sys"]["sunset"],
+            },
+            "main": {
+                "temp": round(weather["main"]["temp"], 1),
+            },
+            "weather": [
+                {"description": weather["weather"][0]["description"]}
+            ],
+        },
+        "forecast": {}
     }
 
-    for label, idx in mapping.items():
-        try:
-            item = forecast["list"][idx]
-            result[label] = {
-                "dt": item["dt"],
-                "temp": round(item["main"]["temp"], 1),
-                "desc": item["weather"][0]["description"],
-                "wind": round(item["wind"]["speed"], 1),
-            }
-        except (IndexError, KeyError):
-            logger.warning(f"Forecast {label} not available")
+    # forecast optionnel
+    if forecast and "list" in forecast and len(forecast["list"]) > 0:
+        # indices typiques:
+        # 0  = +3h
+        # 8  = +24h (8 * 3h)
+        mapping = {"0": 0, "1": 8}
 
-    return result
+        for key, idx in mapping.items():
+            try:
+                item = forecast["list"][idx]
+                payload["forecast"][key] = {
+                    "temp": round(item["main"]["temp"], 1),
+                    "desc": item["weather"][0]["description"],
+                }
+            except (IndexError, KeyError, TypeError):
+                logger.warning(f"Forecast slot {key} not available")
 
+    return payload
 
-def publish_forecast(forecast_data):
-    msgs = []
+# ==========================================================
+# MQTT publish (single retained JSON)
+# ==========================================================
 
-    for period, values in forecast_data.items():
-        for k, v in values.items():
-            topic = f"{MQTT_SERVICE_TOPIC}/forecast/{period}/{k}"
-            msgs.append({"topic": topic, "payload": str(v), "retain": True})
-            logger.info(f"{topic:55} -> {v}")
-
-    publish.multiple(
-        msgs,
+def publish_json(payload):
+    publish.single(
+        topic=MQTT_SERVICE_TOPIC,               # ex: home/lcdmeteo
+        payload=json.dumps(payload, ensure_ascii=False),
         hostname=MQTT_SERVICE_HOST,
         port=MQTT_SERVICE_PORT,
         client_id=MQTT_CLIENT_ID,
-        auth={"username": MQTT_USERNAME, "password": MQTT_PASSWORD},
+        retain=True,
+        auth={
+            "username": MQTT_USERNAME,
+            "password": MQTT_PASSWORD,
+        },
     )
+    logger.info(f"Published retained JSON on {MQTT_SERVICE_TOPIC}")
 
 # ==========================================================
 # Main loop
 # ==========================================================
-
-last_dt = 0
 
 while True:
     try:
         logger.info("Fetching current weather")
         weather = fetch_weather()
 
-        if weather and weather["dt"] > last_dt:
-            last_dt = weather["dt"]
-            publish_weather(weather)
+        logger.info("Fetching forecast")
+        forecast = fetch_forecast()
 
-            logger.info("Fetching forecast")
-            forecast = fetch_forecast()
-            if forecast:
-                extracted = extract_forecast(forecast)
-                publish_forecast(extracted)
-
+        if weather:
+            payload = build_meteo_json(weather, forecast)
+            publish_json(payload)
         else:
-            logger.info("No new weather data")
+            logger.warning("No weather data received (skip publish)")
 
     except Exception:
         logger.exception("Unexpected error")
